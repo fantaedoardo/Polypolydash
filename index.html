@@ -1,0 +1,702 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Tap Dash — Polpo in Fuga</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#021024; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    canvas { width:100vw; height:100vh; display:block; touch-action: manipulation; }
+    .hint {
+      position: fixed; left: 12px; right: 12px; bottom: 10px;
+      color: rgba(255,255,255,0.78); font-size: 12px; line-height: 1.25;
+      text-shadow: 0 2px 12px rgba(0,0,0,0.55);
+      user-select:none; pointer-events:none;
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hint">Tap per saltare • 1 km = 100 punti • +1 vita ogni 3 km • 10 km = SUPER traguardo</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------- Canvas ----------
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha: false });
+
+  function resize() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width  = Math.floor(innerWidth  * dpr);
+    canvas.height = Math.floor(innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  addEventListener("resize", resize, { passive:true });
+  resize();
+
+  // ---------- Helpers ----------
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const rand = (a,b)=>a + Math.random()*(b-a);
+  const lerp = (a,b,t)=>a+(b-a)*t;
+
+  // ---------- Tunings ----------
+  // "World" is 2D side scroller: floor is seabed. Tap = jump.
+  const GROUND_RATIO = 0.80;
+
+  const GRAVITY = 2350;
+  const JUMP_V  = -840;
+
+  // Distance -> km
+  const KM_PX = 1500;             // 1500 px ~ 1 km (tuning)
+  const POINTS_PER_KM = 100;
+
+  // Difficulty curve: slow start, then ramps hard.
+  // Goal: 10 km feels big, 13–15 is brutal.
+  const SPEED_START = 250;        // slow entry
+  const SPEED_SOFT_MAX = 560;     // around 7–10 km
+  const SPEED_HARD_MAX = 860;     // late game
+
+  // Spawn
+  const SPAWN_START = 1.20;       // seconds
+  const SPAWN_MIN   = 0.38;       // near impossible
+  const GAP_START   = 360;
+  const GAP_MIN     = 165;
+
+  // Lives
+  const START_LIVES = 2;
+  const LIFE_EVERY_KM = 3;        // +1 life each 3 km
+  const HIT_INVINCIBLE = 1.05;    // seconds invulnerability after hit
+
+  // Intro shark duration
+  const SHARK_INTRO_TIME = 2.2;   // seconds of visible chase at start
+
+  // ---------- State ----------
+  const state = {
+    started:false,
+    over:false,
+    t:0,
+    dt:0,
+    lastTs:0,
+
+    speed:SPEED_START,
+    spawnTimer:0,
+    distancePx:0,
+    kmCount:0,
+    score:0,
+    best:Number(localStorage.getItem("octoTapBest")||0),
+
+    lives:START_LIVES,
+    inv:0,
+
+    // visuals
+    cameraBob:0,
+    shake:0,
+
+    // progression flags per km
+    addedUpToKm: -1,
+    decoLevel: 0
+  };
+
+  // ---------- Entities ----------
+  const octo = {
+    x:0, y:0, w:56, h:48,
+    vy:0,
+    onGround:true,
+
+    // animation
+    jumpPhase:0,
+    blink:0,
+    wobble:0
+  };
+
+  // Obstacles (corals)
+  const obstacles = []; // {x,y,w,h, kind, swaySeed}
+
+  // Background swimmers (fish, diver, etc.)
+  const swimmers = []; // {x,y,s, kind, phase, speedK}
+
+  // Particles (bubbles)
+  const bubbles = []; // {x,y,r,vx,vy,life,maxLife}
+
+  // Parallax layers
+  const layers = [
+    { x:0, speed:0.15, amp:12, alpha:0.30 },
+    { x:0, speed:0.28, amp:18, alpha:0.22 },
+    { x:0, speed:0.42, amp:22, alpha:0.16 }
+  ];
+
+  // ---------- Layout / Reset ----------
+  function layout() {
+    const W = innerWidth, H = innerHeight;
+    const groundY = H * GROUND_RATIO;
+    octo.x = Math.max(80, W * 0.18);
+    octo.y = groundY - octo.h;
+  }
+
+  function reset() {
+    state.started=false;
+    state.over=false;
+    state.t=0;
+    state.dt=0;
+    state.lastTs=0;
+
+    state.speed=SPEED_START;
+    state.spawnTimer=0;
+    state.distancePx=0;
+    state.kmCount=0;
+    state.score=0;
+
+    state.lives=START_LIVES;
+    state.inv=0;
+    state.cameraBob=0;
+    state.shake=0;
+
+    state.addedUpToKm=-1;
+    state.decoLevel=0;
+
+    obstacles.length=0;
+    swimmers.length=0;
+    bubbles.length=0;
+
+    octo.vy=0;
+    octo.onGround=true;
+    octo.jumpPhase=0;
+    octo.blink=0;
+    octo.wobble=0;
+
+    // pre-seed some fish
+    for (let i=0;i<8;i++) spawnFish(true);
+
+    layout();
+  }
+
+  // ---------- Input ----------
+  function jump() {
+    if (state.over) return;
+    if (!state.started) state.started=true;
+
+    if (octo.onGround) {
+      octo.vy = JUMP_V;
+      octo.onGround=false;
+      // burst bubbles
+      for (let i=0;i<7;i++) spawnBubble(octo.x+octo.w*0.2, octo.y+octo.h*0.6, rand(2,5));
+    }
+  }
+
+  function restartTap(x,y){
+    if (!state.over) return false;
+    const W=innerWidth, H=innerHeight;
+    const bw=Math.min(270, W*0.64), bh=54;
+    const bx=(W-bw)/2, by=H*0.62;
+    return x>=bx && x<=bx+bw && y>=by && y<=by+bh;
+  }
+
+  function onPointer(ev){
+    const rect = canvas.getBoundingClientRect();
+    const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - rect.left;
+    const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - rect.top;
+
+    if (restartTap(x,y)) { reset(); return; }
+    jump();
+  }
+  canvas.addEventListener("pointerdown", onPointer, { passive:true });
+  addEventListener("keydown", (e)=>{
+    if (e.code==="Space" || e.code==="ArrowUp") {
+      e.preventDefault();
+      if (state.over) { reset(); return; }
+      jump();
+    }
+  });
+
+  // iOS: avoid double-tap zoom
+  let lastTouch=0;
+  addEventListener("touchend",(e)=>{
+    const now=Date.now();
+    if (now-lastTouch<=350) e.preventDefault();
+    lastTouch=now;
+  },{passive:false});
+
+  // ---------- Difficulty ----------
+  function km() { return state.distancePx / KM_PX; }
+
+  function difficulty(kmVal) {
+    // Smooth curve that becomes nasty after ~9-10 km:
+    // 0..6 km: gentle
+    // 6..10 km: noticeable
+    // 10..15 km: steep / "almost impossible"
+    const a = clamp(kmVal/6, 0, 1);
+    const b = clamp((kmVal-6)/4, 0, 1);
+    const c = clamp((kmVal-10)/5, 0, 1);
+    // combine with weights
+    return a*0.9 + b*1.4 + c*2.4; // up to ~4.7 near 15km
+  }
+
+  function computeSpeed(kmVal) {
+    const d = difficulty(kmVal);
+    // Start slow then move toward soft max, then toward hard max
+    const soft = lerp(SPEED_START, SPEED_SOFT_MAX, clamp(d/1.8, 0, 1));
+    const hard = lerp(SPEED_SOFT_MAX, SPEED_HARD_MAX, clamp((d-1.8)/2.9, 0, 1));
+    return d < 1.8 ? soft : hard;
+  }
+
+  function computeSpawnInterval(kmVal) {
+    const d = difficulty(kmVal);
+    const t = clamp(d/4.7, 0, 1);
+    // nonlinear tightening
+    return clamp(SPAWN_START * (1 - 0.72*Math.pow(t, 1.25)), SPAWN_MIN, SPAWN_START);
+  }
+
+  function computeMinGap(kmVal) {
+    const d = difficulty(kmVal);
+    const t = clamp(d/4.7, 0, 1);
+    return clamp(GAP_START * (1 - 0.55*Math.pow(t, 1.15)), GAP_MIN, GAP_START);
+  }
+
+  // ---------- Spawning: corals ----------
+  function spawnCoral() {
+    const W=innerWidth, H=innerHeight;
+    const groundY=H*GROUND_RATIO;
+    const kmVal = km();
+    const d = difficulty(kmVal);
+
+    const baseH = rand(54, 92) + d*6;           // taller later
+    const h = clamp(baseH, 56, 170);
+    const w = clamp(h * rand(0.35, 0.55), 26, 86);
+
+    const kind = (d > 2.2 && Math.random()<0.25) ? "fan" : (Math.random()<0.5 ? "branch" : "tube");
+
+    obstacles.push({
+      x: W + rand(40, 140),
+      y: groundY - h,
+      w, h,
+      kind,
+      swaySeed: Math.random()*10
+    });
+  }
+
+  // ---------- Background: fish/diver/goggles/specials ----------
+  function spawnFish(initial=false) {
+    const W=innerWidth, H=innerHeight;
+    const groundY=H*GROUND_RATIO;
+    const y = rand(H*0.18, groundY-120);
+    swimmers.push({
+      x: initial ? rand(0,W) : W + rand(40, 220),
+      y,
+      s: rand(0.6, 1.2),
+      kind: "fish",
+      phase: Math.random()*10,
+      speedK: rand(0.12, 0.28)
+    });
+  }
+
+  function spawnDiver() {
+    const W=innerWidth, H=innerHeight;
+    swimmers.push({
+      x: W + rand(60, 200),
+      y: rand(H*0.22, H*0.55),
+      s: rand(0.85, 1.05),
+      kind: "diver",
+      phase: Math.random()*10,
+      speedK: rand(0.10, 0.18)
+    });
+  }
+
+  function spawnGoggles() {
+    const W=innerWidth, H=innerHeight;
+    swimmers.push({
+      x: W + rand(60, 220),
+      y: rand(H*0.26, H*0.62),
+      s: rand(0.9, 1.15),
+      kind: "goggles",
+      phase: Math.random()*10,
+      speedK: rand(0.16, 0.24)
+    });
+  }
+
+  function spawnSpecialFish() {
+    const W=innerWidth, H=innerHeight;
+    swimmers.push({
+      x: W + rand(80, 240),
+      y: rand(H*0.20, H*0.60),
+      s: rand(1.0, 1.5),
+      kind: "special",
+      phase: Math.random()*10,
+      speedK: rand(0.18, 0.30)
+    });
+  }
+
+  function spawnBubble(x,y,r) {
+    bubbles.push({
+      x: x + rand(-6,6),
+      y: y + rand(-6,6),
+      r,
+      vx: rand(-12, 12),
+      vy: rand(-70, -120),
+      life: 0,
+      maxLife: rand(0.9, 1.6)
+    });
+  }
+
+  // Each km add something new (level-up visuals)
+  function applyKmDecor(kmInt) {
+    // add an element every km; cycle types
+    const mod = kmInt % 3;
+    if (mod === 0) spawnDiver();
+    if (mod === 1) spawnGoggles();
+    if (mod === 2) spawnSpecialFish();
+
+    // also add a few fish as density increases
+    for (let i=0;i<2;i++) spawnFish(false);
+  }
+
+  // ---------- Collision ----------
+  function aabb(ax,ay,aw,ah,bx,by,bw,bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  function takeHit() {
+    if (state.inv > 0) return;
+    state.lives -= 1;
+    state.inv = HIT_INVINCIBLE;
+    state.shake = 10;
+    // bubbles burst
+    for (let i=0;i<14;i++) spawnBubble(octo.x+octo.w*0.4, octo.y+octo.h*0.5, rand(2,6));
+    if (state.lives <= 0) {
+      state.over = true;
+      if (state.score > state.best) {
+        state.best = state.score;
+        localStorage.setItem("octoTapBest", String(state.best));
+      }
+    }
+  }
+
+  // ---------- Drawing ----------
+  function drawBackground(W,H,groundY) {
+    // Ocean gradient
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0, "#2ff3ff");
+    g.addColorStop(0.35, "#1b9dff");
+    g.addColorStop(1, "#021024");
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    // Light caustics moving (immersive dynamic)
+    ctx.globalAlpha = 0.12;
+    ctx.fillStyle = "#ffffff";
+    const t = state.t;
+    for (let i=0;i<6;i++){
+      const yy = H*(0.12 + i*0.09) + Math.sin(t*0.9 + i)*10;
+      ctx.beginPath();
+      ctx.ellipse(W/2 + Math.sin(t*0.4+i)*70, yy, W*0.58, 30+Math.sin(t*1.1+i)*8, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Parallax “reef silhouettes”
+    layers.forEach((L, idx) => {
+      L.x -= state.speed * L.speed * state.dt;
+      if (L.x < -W) L.x += W;
+
+      ctx.globalAlpha = L.alpha;
+      ctx.fillStyle = idx===0 ? "#0b3a5e" : idx===1 ? "#072d4d" : "#05223d";
+      for (let rep=-1; rep<=1; rep++) {
+        const ox = L.x + rep*W;
+        ctx.beginPath();
+        ctx.moveTo(ox, groundY);
+        for (let x=0; x<=W; x+=44) {
+          const yy = groundY - (80 + idx*42) + Math.sin((x*0.012) + t*0.6 + idx)*L.amp;
+          ctx.lineTo(ox + x, yy);
+        }
+        ctx.lineTo(ox + W, groundY);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    });
+
+    // Seabed
+    const sand = ctx.createLinearGradient(0, groundY, 0, H);
+    sand.addColorStop(0, "#ffdc9e");
+    sand.addColorStop(1, "#cfa56b");
+    ctx.fillStyle = sand;
+    ctx.fillRect(0, groundY, W, H-groundY);
+
+    // Seabed ripple line
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, groundY+2);
+    ctx.lineTo(W, groundY+2);
+    ctx.stroke();
+  }
+
+  function drawCoral(o) {
+    // Coral sways slightly (dynamic)
+    const sway = Math.sin(state.t*1.6 + o.swaySeed) * 3;
+    const x=o.x, y=o.y, w=o.w, h=o.h;
+
+    // shadow
+    ctx.fillStyle = "rgba(0,0,0,0.12)";
+    ctx.beginPath();
+    ctx.ellipse(x+w/2, y+h+8, w*0.55, 10, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    if (o.kind === "tube") {
+      ctx.fillStyle = "rgba(255,110,180,0.95)";
+      for (let i=0;i<3;i++){
+        const tw = w*(0.28 + i*0.06);
+        const th = h*(0.72 + i*0.08);
+        const tx = x + w*0.10 + i*w*0.22 + sway*0.15;
+        const ty = y + h - th;
+        ctx.beginPath();
+        ctx.roundRect(tx, ty, tw, th, 14);
+        ctx.fill();
+        ctx.fillStyle = "rgba(255,220,245,0.45)";
+        ctx.beginPath();
+        ctx.roundRect(tx+tw*0.18, ty+th*0.10, tw*0.22, th*0.75, 10);
+        ctx.fill();
+        ctx.fillStyle = "rgba(255,110,180,0.95)";
+      }
+    } else if (o.kind === "fan") {
+      ctx.fillStyle = "rgba(255,120,60,0.95)";
+      ctx.beginPath();
+      ctx.moveTo(x+w*0.15 + sway, y+h);
+      ctx.quadraticCurveTo(x+w*0.25 + sway, y+h*0.35, x+w*0.5 + sway*0.2, y+h*0.18);
+      ctx.quadraticCurveTo(x+w*0.82 + sway, y+h*0.35, x+w*0.85 + sway, y+h);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.strokeStyle = "rgba(255,230,200,0.45)";
+      ctx.lineWidth = 2;
+      for (let i=0;i<6;i++){
+        ctx.beginPath();
+        ctx.moveTo(x+w*(0.20+i*0.12)+sway*0.6, y+h);
+        ctx.quadraticCurveTo(x+w*(0.30+i*0.08)+sway*0.4, y+h*0.52, x+w*(0.45+i*0.04)+sway*0.2, y+h*0.22);
+        ctx.stroke();
+      }
+    } else { // branch
+      ctx.fillStyle = "rgba(140,255,120,0.92)";
+      ctx.beginPath();
+      ctx.roundRect(x+w*0.42 + sway*0.3, y+h*0.32, w*0.16, h*0.68, 10);
+      ctx.fill();
+
+      const branches = 4;
+      for (let i=0;i<branches;i++){
+        const bx = x+w*0.50 + sway*0.3;
+        const by = y+h*(0.45 + i*0.12);
+        const len = w*(0.38 + i*0.06);
+        ctx.strokeStyle = "rgba(140,255,120,0.92)";
+        ctx.lineWidth = 8;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(bx + len*(i%2?1:-1) + sway, by - h*0.10);
+        ctx.stroke();
+
+        // tips
+        ctx.fillStyle = "rgba(255,255,255,0.22)";
+        ctx.beginPath();
+        ctx.arc(bx + len*(i%2?1:-1) + sway, by - h*0.10, 5, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+  }
+
+  function drawSwimmer(s) {
+    const t = state.t;
+    const bob = Math.sin(t*1.2 + s.phase) * 6;
+    const x = s.x, y = s.y + bob;
+    const scale = s.s;
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+
+    if (s.kind === "fish") {
+      ctx.fillStyle = "rgba(255,240,90,0.95)";
+      ctx.beginPath();
+      ctx.ellipse(0,0,18,10,0,0,Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = "rgba(255,120,50,0.95)";
+      ctx.beginPath();
+      ctx.moveTo(-16,0);
+      ctx.lineTo(-30,-10);
+      ctx.lineTo(-30,10);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = "#0a1c2d";
+      ctx.beginPath();
+      ctx.arc(8,-2,2.3,0,Math.PI*2);
+      ctx.fill();
+    }
+
+    if (s.kind === "special") {
+      // “pesce particolare” (tipo palla/spinata fantasy)
+      ctx.fillStyle = "rgba(180,120,255,0.95)";
+      ctx.beginPath();
+      ctx.ellipse(0,0,20,16,0,0,Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.45)";
+      ctx.lineWidth = 2;
+      for (let i=0;i<8;i++){
+        const a = i*(Math.PI*2/8);
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a)*8, Math.sin(a)*6);
+        ctx.lineTo(Math.cos(a)*26, Math.sin(a)*20);
+        ctx.stroke();
+      }
+      ctx.fillStyle = "#081629";
+      ctx.beginPath();
+      ctx.arc(6,-2,2.6,0,Math.PI*2);
+      ctx.fill();
+    }
+
+    if (s.kind === "diver") {
+      // Sommozzatore stilizzato
+      ctx.fillStyle = "rgba(30,30,40,0.9)";
+      ctx.beginPath();
+      ctx.roundRect(-10,-14,20,28,10);
+      ctx.fill();
+      ctx.fillStyle = "rgba(255,220,180,0.95)";
+      ctx.beginPath();
+      ctx.arc(0,-18,10,0,Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = "rgba(80,220,255,0.85)";
+      ctx.beginPath();
+      ctx.roundRect(-10,-24,20,12,6);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.35)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(-4,-12); ctx.lineTo(-14,2);
+      ctx.moveTo(4,-12);  ctx.lineTo(14,2);
+      ctx.stroke();
+      // little bubbles
+      ctx.globalAlpha = 0.7;
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.beginPath(); ctx.arc(16,-20,3,0,Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(22,-28,2,0,Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    if (s.kind === "goggles") {
+      // Occhialini stile Nemo (oggetto “che passa”)
+      ctx.fillStyle = "rgba(255,120,0,0.92)";
+      ctx.beginPath();
+      ctx.roundRect(-22,-10,44,20,10);
+      ctx.fill();
+      ctx.fillStyle = "rgba(120,240,255,0.85)";
+      ctx.beginPath();
+      ctx.ellipse(-10,0,10,7,0,0,Math.PI*2);
+      ctx.ellipse(10,0,10,7,0,0,Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.4)";
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(-34,0); ctx.lineTo(-22,0);
+      ctx.moveTo(22,0); ctx.lineTo(34,0);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function drawOctopus(W,H,groundY) {
+    const t = state.t;
+
+    // Body animation: wobble + squash/stretch during jump
+    // jumpPhase based on vertical velocity
+    const vy = octo.vy;
+    const stretch = clamp((-vy)/1100, -0.35, 0.45); // upward -> stretch
+    const squash = clamp((vy)/1200, 0, 0.35);       // falling -> squash
+    const sx = 1 + squash - stretch*0.25;
+    const sy = 1 - squash + stretch;
+
+    const bob = Math.sin(t*2.4 + octo.wobble) * 2.5;
+    const invFlash = (state.inv>0) ? (Math.sin(t*24)>0 ? 0.35 : 1.0) : 1.0;
+
+    // shadow
+    ctx.globalAlpha = 0.18 * invFlash;
+    ctx.fillStyle = "#000";
+    ctx.beginPath();
+    const shW = octo.w*0.62 * (octo.onGround ? 1 : 0.75);
+    ctx.ellipse(octo.x+octo.w/2, groundY+8, shW, 12, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    ctx.save();
+    ctx.translate(octo.x + octo.w/2, octo.y + octo.h/2 + bob);
+    ctx.scale(sx, sy);
+
+    // color shifts slightly over time (fun)
+    const hue = 180 + Math.sin(t*0.6)*18;
+    const bodyColor = `hsl(${hue}, 85%, 62%)`;
+    const bellyColor = `hsla(${hue+25}, 90%, 78%, 0.8)`;
+
+    ctx.globalAlpha = invFlash;
+
+    // Body
+    ctx.fillStyle = bodyColor;
+    ctx.beginPath();
+    ctx.ellipse(0, -2, octo.w*0.42, octo.h*0.36, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Head top
+    ctx.beginPath();
+    ctx.ellipse(0, -18, octo.w*0.34, octo.h*0.30, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Belly highlight
+    ctx.fillStyle = bellyColor;
+    ctx.beginPath();
+    ctx.ellipse(6, 0, octo.w*0.18, octo.h*0.16, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Tentacles (animated)
+    const tentN = 6;
+    for (let i=0;i<tentN;i++){
+      const a = -Math.PI*0.9 + i*(Math.PI*1.8/(tentN-1));
+      const sway = Math.sin(t*5 + i*1.2 + octo.jumpPhase) * (octo.onGround? 6 : 12);
+      const len = octo.h*(0.40 + (i%2)*0.06);
+      const x0 = Math.cos(a)*octo.w*0.16;
+      const y0 = octo.h*0.16;
+      const x1 = x0 + Math.cos(a)*len*0.35 + sway*0.35;
+      const y1 = y0 + len*0.55;
+      const x2 = x0 + Math.cos(a)*len*0.15 + sway;
+      const y2 = y0 + len*0.92;
+
+      ctx.strokeStyle = `hsla(${hue}, 85%, 58%, 0.95)`;
+      ctx.lineWidth = 10 - i*0.7;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.quadraticCurveTo(x1, y1, x2, y2);
+      ctx.stroke();
+
+      // suction dots
+      ctx.fillStyle = "rgba(255,255,255,0.25)";
+      for (let k=0;k<3;k++){
+        const tt = (k+1)/4;
+        const px = (1-tt)*(1-tt)*x0 + 2*(1-tt)*tt*x1 + tt*tt*x2;
+        const py = (1-tt)*(1-tt)*y0 + 2*(1-tt)*tt*y1 + tt*tt*y2;
+        ctx.beginPath();
+        ctx.arc(px+2, py, 2.2, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    // Face
+    octo.blink -= state.dt;
+    if (octo.blink<=0 && Math.random()<0.012) octo.blink = 0.11;
+
+    ctx.fillStyle = "#062033";
+    if (octo.blink>0) {
+      ctx.strokeStyle = "#062033";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(-14,-18); ctx.lineTo(-6,-18);
+      ctx.moveTo(6,-18);  ctx.lineTo(14,-18);
+      ctx.stroke();
+    } else {
+      ctx.beginPath
