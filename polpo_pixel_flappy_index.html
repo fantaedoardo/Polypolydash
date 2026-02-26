@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+  <meta name="theme-color" content="#021024" />
+  <title>Tap Dash — Polpo Pixel (Flappy)</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#021024; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    canvas { width:100vw; height:100vh; display:block; touch-action: none; }
+    .hint {
+      position: fixed; left: 12px; right: 12px; bottom: 10px;
+      color: rgba(255,255,255,0.78); font-size: 12px; line-height: 1.25;
+      text-shadow: 0 2px 12px rgba(0,0,0,0.55);
+      user-select:none; pointer-events:none;
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hint">Tap/press & hold = spinta verso l'alto • 1 km = 100 punti • +1 vita ogni 3 km • 10 km = traguardo</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------- Canvas / Pixelated rendering ----------
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha:false });
+
+  // Render to low-res buffer, then scale up without smoothing (pixel-art look)
+  const buf = document.createElement("canvas");
+  const btx = buf.getContext("2d", { alpha:false });
+
+  function resize() {
+    const W = innerWidth, H = innerHeight;
+    canvas.width = W; canvas.height = H;
+
+    // Low-res buffer: scale factor based on screen size
+    const scale = W < 420 ? 3 : W < 900 ? 4 : 5; // bigger screens -> more pixels
+    buf.width = Math.floor(W / scale);
+    buf.height = Math.floor(H / scale);
+
+    // keep pixels crisp
+    ctx.imageSmoothingEnabled = false;
+    btx.imageSmoothingEnabled = false;
+  }
+  addEventListener("resize", resize, { passive:true });
+  resize();
+
+  // ---------- Helpers ----------
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const rand = (a,b)=>a + Math.random()*(b-a);
+  const lerp = (a,b,t)=>a+(b-a)*t;
+  const smoothStep = (t)=>t*t*(3-2*t);
+
+  // ---------- Gameplay tuning (Flappy-like) ----------
+  // We use "km" based on horizontal distance travelled.
+  // "Accorciamo i km" so 10km is reachable in a normal session.
+  const KM_PX = 900;               // pixels = 1 km (shorter)
+  const POINTS_PER_KM = 100;
+
+  const START_LIVES = 2;
+  const LIFE_EVERY_KM = 3;
+  const HIT_INVINCIBLE = 1.0;
+
+  // Physics: octopus is always in water, moves vertically
+  const GRAVITY = 1550;            // px/s^2 (buffer pixels, since we simulate in buffer coords)
+  const THRUST = 2650;             // px/s^2 upward when holding
+  const MAX_VY_UP = -520;
+  const MAX_VY_DOWN = 760;
+
+  // World speed pacing: easy until 5 km, harder 9-10 km but doable
+  const SPEED_START = 95;
+  const SPEED_5KM   = 135;
+  const SPEED_9KM   = 165;
+  const SPEED_10KM  = 185;
+
+  // Obstacles: top+bottom coral with a gap
+  const GAP_START = 130;           // gap size in px (buffer coords)
+  const GAP_5KM   = 118;
+  const GAP_9KM   = 104;
+  const GAP_10KM  = 96;
+
+  const SPAWN_START = 1.30;
+  const SPAWN_5KM   = 1.12;
+  const SPAWN_9KM   = 0.95;
+  const SPAWN_10KM  = 0.88;
+
+  // Visual budget
+  const MAX_BUBBLES = 90;
+  const MAX_FISH = 10;
+
+  // ---------- State ----------
+  const state = {
+    started:false,
+    over:false,
+    t:0, dt:0, lastTs:0,
+
+    speed:SPEED_START,
+    spawnTimer:0,
+    distancePx:0,
+    kmCount:0,
+    score:0,
+    best:Number(localStorage.getItem("octoFlapBest")||0),
+
+    lives:START_LIVES,
+    inv:0,
+
+    hold:false,
+    holdTime:0,
+
+    cameraBob:0,
+    shake:0,
+
+    addedUpToKm:-1
+  };
+
+  // ---------- Entities ----------
+  const octo = {
+    x:0, y:0, r:10,     // radius-ish in buffer px
+    vy:0,
+    blink:0,
+    phase:0
+  };
+
+  // obstacle: {x, gapY, gapH, w, kind, seed}
+  const obstacles = [];
+  // swimmers: {x,y,kind,hue,phase,spd}
+  const swimmers = [];
+  // bubbles: {x,y,r,vx,vy,life,maxLife}
+  const bubbles = [];
+
+  const layers = [
+    { x:0, speed:0.18, amp:4, alpha:0.32 },
+    { x:0, speed:0.32, amp:6, alpha:0.24 },
+    { x:0, speed:0.48, amp:8, alpha:0.18 }
+  ];
+
+  function W(){ return buf.width; }
+  function H(){ return buf.height; }
+
+  function reset() {
+    state.started=false;
+    state.over=false;
+    state.t=0; state.dt=0; state.lastTs=0;
+    state.speed=SPEED_START;
+    state.spawnTimer=0;
+    state.distancePx=0;
+    state.kmCount=0;
+    state.score=0;
+    state.lives=START_LIVES;
+    state.inv=0;
+    state.hold=false;
+    state.holdTime=0;
+    state.cameraBob=0;
+    state.shake=0;
+    state.addedUpToKm=-1;
+
+    obstacles.length=0;
+    swimmers.length=0;
+    bubbles.length=0;
+
+    octo.x = Math.floor(W()*0.28);
+    octo.y = Math.floor(H()*0.52);
+    octo.vy = 0;
+    octo.blink = 0;
+    octo.phase = 0;
+
+    for (let i=0;i<7;i++) spawnFish(true);
+  }
+
+  // ---------- Input (tap/hold = longer lift) ----------
+  function startIfNeeded(){ if (!state.started && !state.over) state.started = true; }
+
+  function onDown() {
+    if (state.over) return;
+    startIfNeeded();
+    state.hold = true;
+    state.holdTime = 0;
+    // little bubbles
+    for (let i=0;i<4;i++) spawnBubble(octo.x-6, octo.y+6, rand(1.2,2.2));
+  }
+  function onUp() {
+    state.hold = false;
+    state.holdTime = 0;
+  }
+
+  function restartTap(x,y){
+    if (!state.over) return false;
+    const bw = Math.min(170, W()*0.75);
+    const bh = 28;
+    const bx = (W()-bw)/2;
+    const by = H()*0.62;
+    return x>=bx && x<=bx+bw && y>=by && y<=by+bh;
+  }
+
+  function getXY(ev){
+    const rect = canvas.getBoundingClientRect();
+    const p = (ev.touches && ev.touches[0]) ? ev.touches[0] : ev;
+    // map screen -> buffer coords
+    const sx = (p.clientX ?? 0) - rect.left;
+    const sy = (p.clientY ?? 0) - rect.top;
+    const x = sx * (W()/rect.width);
+    const y = sy * (H()/rect.height);
+    return {x,y};
+  }
+
+  canvas.addEventListener("pointerdown", (ev)=>{
+    const {x,y} = getXY(ev);
+    if (restartTap(x,y)) { reset(); return; }
+    onDown();
+  }, { passive:true });
+
+  canvas.addEventListener("pointerup", onUp, { passive:true });
+  canvas.addEventListener("pointercancel", onUp, { passive:true });
+
+  canvas.addEventListener("touchstart", (e)=>{ e.preventDefault(); }, { passive:false });
+
+  addEventListener("keydown", (e)=>{
+    if (e.code==="Space" || e.code==="ArrowUp") { e.preventDefault(); if (state.over){ reset(); return; } onDown(); }
+  });
+  addEventListener("keyup", (e)=>{
+    if (e.code==="Space" || e.code==="ArrowUp") { e.preventDefault(); onUp(); }
+  });
+
+  // ---------- Difficulty / pacing ----------
+  function km() { return state.distancePx / KM_PX; }
+
+  function speedAt(kmVal){
+    if (kmVal <= 5){
+      const t = smoothStep(clamp(kmVal/5,0,1));
+      return lerp(SPEED_START, SPEED_5KM, t);
+    }
+    if (kmVal <= 9){
+      const t = smoothStep(clamp((kmVal-5)/4,0,1));
+      return lerp(SPEED_5KM, SPEED_9KM, t);
+    }
+    const t = smoothStep(clamp((kmVal-9)/1,0,1));
+    return lerp(SPEED_9KM, SPEED_10KM, t);
+  }
+
+  function gapAt(kmVal){
+    if (kmVal <= 5){
+      const t = smoothStep(clamp(kmVal/5,0,1));
+      return lerp(GAP_START, GAP_5KM, t);
+    }
+    if (kmVal <= 9){
+      const t = smoothStep(clamp((kmVal-5)/4,0,1));
+      return lerp(GAP_5KM, GAP_9KM, t);
+    }
+    const t = smoothStep(clamp((kmVal-9)/1,0,1));
+    return lerp(GAP_9KM, GAP_10KM, t);
+  }
+
+  function spawnIntervalAt(kmVal){
+    if (kmVal <= 5){
+      const t = smoothStep(clamp(kmVal/5,0,1));
+      return lerp(SPAWN_START, SPAWN_5KM, t);
+    }
+    if (kmVal <= 9){
+      const t = smoothStep(clamp((kmVal-5)/4,0,1));
+      return lerp(SPAWN_5KM, SPAWN_9KM, t);
+    }
+    const t = smoothStep(clamp((kmVal-9)/1,0,1));
+    return lerp(SPAWN_9KM, SPAWN_10KM, t);
+  }
+
+  // ---------- Obstacles (top+bottom corals) ----------
+  function spawnObstacle() {
+    const w = rand(22, 30);
+    const kmVal = km();
+    const gapH = gapAt(kmVal);
+
+    // Keep gap within play area, and avoid too close to edges
+    const margin = 26;
+    const minY = margin;
+    const maxY = H() - margin - gapH;
+    const gapY = rand(minY, maxY);
+
+    obstacles.push({
+      x: W() + rand(18, 40),
+      gapY,
+      gapH,
+      w,
+      kind: Math.random()<0.5 ? "tube" : "fan",
+      seed: Math.random()*10
+    });
+  }
+
+  // ---------- Background fish / deco ----------
+  function spawnFish(initial=false) {
+    const y = rand(24, H()-40);
+    swimmers.push({
+      x: initial ? rand(0,W()) : W() + rand(30, 120),
+      y,
+      kind: "fish",
+      hue: rand(0,360),
+      phase: Math.random()*10,
+      spd: rand(0.10, 0.24)
+    });
+  }
+  function spawnSpecial(){
+    swimmers.push({
+      x: W() + rand(30, 140),
+      y: rand(26, H()-44),
+      kind: "special",
+      hue: rand(160, 320),
+      phase: Math.random()*10,
+      spd: rand(0.14, 0.28)
+    });
+  }
+  function spawnDiver(){
+    swimmers.push({
+      x: W() + rand(30, 140),
+      y: rand(28, H()*0.75),
+      kind: "diver",
+      hue: 0,
+      phase: Math.random()*10,
+      spd: rand(0.10, 0.16)
+    });
+  }
+  function spawnGoggles(){
+    swimmers.push({
+      x: W() + rand(30, 140),
+      y: rand(28, H()-42),
+      kind: "goggles",
+      hue: 0,
+      phase: Math.random()*10,
+      spd: rand(0.14, 0.20)
+    });
+  }
+
+  function applyKmDecor(kmInt){
+    const mod = kmInt % 3;
+    if (mod===0) spawnDiver();
+    if (mod===1) spawnGoggles();
+    if (mod===2) spawnSpecial();
+    if (swimmers.filter(s=>s.kind==="fish").length < Math.min(MAX_FISH, 6 + Math.floor(km()/2))) spawnFish(false);
+  }
+
+  // ---------- Bubbles ----------
+  function spawnBubble(x,y,r){
+    if (bubbles.length > MAX_BUBBLES) return;
+    bubbles.push({
+      x: x + rand(-3,3),
+      y: y + rand(-3,3),
+      r,
+      vx: rand(-6,6),
+      vy: rand(-48, -86),
+      life: 0,
+      maxLife: rand(0.8, 1.4)
+    });
+  }
+
+  // ---------- Collision ----------
+  function aabb(ax,ay,aw,ah,bx,by,bw,bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  function takeHit(){
+    if (state.inv>0) return;
+    state.lives -= 1;
+    state.inv = HIT_INVINCIBLE;
+    state.shake = 6;
+
+    for (let i=0;i<10;i++) spawnBubble(octo.x, octo.y, rand(1.3,2.7));
+
+    if (state.lives<=0){
+      state.over = true;
+      if (state.score > state.best){
+        state.best = state.score;
+        localStorage.setItem("octoFlapBest", String(state.best));
+      }
+    }
+  }
+
+  // ---------- Draw (pixel art primitives) ----------
+  function drawBackground(){
+    const w = W(), h = H();
+    // gradient bands (pixel style)
+    btx.fillStyle = "#021024";
+    btx.fillRect(0,0,w,h);
+
+    // simple banded ocean (more "colorata")
+    const bands = 8;
+    for (let i=0;i<bands;i++){
+      const y0 = Math.floor(h * (i/bands));
+      const y1 = Math.floor(h * ((i+1)/bands));
+      const c = 210 + i*4;
+      btx.fillStyle = `rgb(${Math.floor(10+i*3)}, ${Math.floor(80+i*18)}, ${Math.floor(140+i*12)})`;
+      btx.fillRect(0,y0,w,y1-y0);
+    }
+
+    // moving caustics (pixel)
+    btx.globalAlpha = 0.12;
+    btx.fillStyle = "#fff";
+    const t = state.t;
+    for (let i=0;i<5;i++){
+      const yy = Math.floor(h*(0.14 + i*0.12) + Math.sin(t*1.1 + i)*3);
+      const ww = Math.floor(w*(0.78));
+      const xx = Math.floor((w-ww)/2 + Math.sin(t*0.5+i)*8);
+      btx.fillRect(xx, yy, ww, 2);
+    }
+    btx.globalAlpha = 1;
+
+    // parallax reef silhouettes
+    layers.forEach((L, idx)=>{
+      L.x -= state.speed * L.speed * state.dt;
+      if (L.x < -w) L.x += w;
+
+      btx.globalAlpha = L.alpha;
+      btx.fillStyle = idx===0 ? "#07345a" : idx===1 ? "#052a49" : "#04213b";
+      for (let rep=-1; rep<=1; rep++){
+        const ox = Math.floor(L.x + rep*w);
+        const baseY = Math.floor(h*0.82 - idx*10);
+        btx.beginPath();
+        btx.moveTo(ox, h);
+        for (let x=0; x<=w; x+=6){
+          const yy = baseY - Math.floor(12 + idx*8) + Math.floor(Math.sin((x*0.12)+t*0.9+idx)*L.amp);
+          btx.lineTo(ox+x, yy);
+        }
+        btx.lineTo(ox+w, h);
+        btx.closePath();
+        btx.fill();
+      }
+      btx.globalAlpha = 1;
+    });
+
+    // bubbles particles
+    if (Math.random() < 0.06) spawnBubble(rand(0,w), rand(h*0.35, h*0.95), rand(1.0,2.2));
+  }
+
+  function drawObstacle(o){
+    const x = Math.floor(o.x);
+    const w = Math.floor(o.w);
+    const topH = Math.floor(o.gapY);
+    const botY = Math.floor(o.gapY + o.gapH);
+    const botH = Math.floor(H() - botY);
+
+    // coral colors
+    const sway = Math.sin(state.t*1.5 + o.seed) * 1;
+    // top coral
+    btx.fillStyle = o.kind==="tube" ? "#ff67c8" : "#ff9a3c";
+    btx.fillRect(x, 0, w, topH);
+    // little texture
+    btx.fillStyle = "rgba(255,255,255,0.18)";
+    for (let i=0;i<3;i++){
+      btx.fillRect(x + 3 + i*6, Math.floor(topH*0.25)+i*4, 2, 6);
+    }
+    // bottom coral
+    btx.fillStyle = o.kind==="tube" ? "#ff67c8" : "#ff9a3c";
+    btx.fillRect(x, botY, w, botH);
+
+    // outlines for pixel clarity
+    btx.fillStyle = "rgba(0,0,0,0.18)";
+    btx.fillRect(x, 0, 1, topH);
+    btx.fillRect(x+w-1, 0, 1, topH);
+    btx.fillRect(x, botY, 1, botH);
+    btx.fillRect(x+w-1, botY, 1, botH);
+
+    // small swaying "fan" hint near gap edges
+    btx.fillStyle = "rgba(255,255,255,0.10)";
+    btx.fillRect(x, Math.floor(o.gapY-2+sway), w, 1);
+    btx.fillRect(x, Math.floor(o.gapY+o.gapH+1+sway), w, 1);
+  }
+
+  function drawSwimmer(s){
+    const t = state.t;
+    const x = Math.floor(s.x);
+    const y = Math.floor(s.y + Math.sin(t*1.3 + s.phase)*2);
+
+    if (s.kind==="fish"){
+      btx.fillStyle = `hsl(${s.hue} 90% 60%)`;
+      btx.fillRect(x, y, 6, 3);
+      btx.fillStyle = `hsl(${(s.hue+35)%360} 90% 52%)`;
+      btx.fillRect(x-2, y+1, 2, 1);
+      btx.fillStyle = "#001525";
+      btx.fillRect(x+5, y+1, 1, 1);
+      return;
+    }
+
+    if (s.kind==="special"){
+      btx.fillStyle = `hsl(${s.hue} 86% 62%)`;
+      btx.fillRect(x, y, 5, 5);
+      btx.fillStyle = "rgba(255,255,255,0.25)";
+      btx.fillRect(x+1, y+1, 1, 1);
+      btx.fillRect(x+3, y+2, 1, 1);
+      return;
+    }
+
+    if (s.kind==="diver"){
+      btx.fillStyle = "rgba(20,20,28,0.95)";
+      btx.fillRect(x, y, 4, 7);
+      btx.fillStyle = "rgba(255,220,180,0.95)";
+      btx.fillRect(x+1, y-2, 2, 2);
+      btx.fillStyle = "rgba(90,230,255,0.85)";
+      btx.fillRect(x, y-2, 4, 1);
+      return;
+    }
+
+    if (s.kind==="goggles"){
+      btx.fillStyle = "rgba(255,120,0,0.95)";
+      btx.fillRect(x, y, 6, 2);
+      btx.fillStyle = "rgba(120,240,255,0.85)";
+      btx.fillRect(x+1, y, 1, 2);
+      btx.fillRect(x+4, y, 1, 2);
+      return;
+    }
+  }
+
+  function drawOcto(){
+    // wobble animation
+    octo.phase += state.dt * (state.hold ? 7.5 : 5.5);
+
+    // body colors
+    const hue = 190 + Math.sin(state.t*0.6)*18;
+    const x = Math.floor(octo.x);
+    const y = Math.floor(octo.y);
+
+    // inv flash
+    const inv = state.inv>0 && (Math.sin(state.t*24)>0) ? 0.35 : 1.0;
+    btx.globalAlpha = inv;
+
+    // body (pixel)
+    btx.fillStyle = `hsl(${hue} 85% 60%)`;
+    btx.fillRect(x-3, y-2, 7, 6);
+    btx.fillRect(x-2, y-4, 5, 3);
+
+    // tentacles (animate)
+    btx.fillStyle = `hsl(${hue} 85% 54%)`;
+    for (let i=0;i<4;i++){
+      const sway = Math.round(Math.sin(octo.phase + i*1.2)*1);
+      btx.fillRect(x-3+i*2 + sway, y+4, 1, 3);
+    }
+
+    // face
+    const blink = (octo.blink>0);
+    if (!blink){
+      btx.fillStyle = "#041b2e";
+      btx.fillRect(x-2, y-3, 1, 1);
+      btx.fillRect(x+1, y-3, 1, 1);
+      btx.fillStyle = "rgba(255,255,255,0.7)";
+      btx.fillRect(x-2, y-4, 1, 1);
+      btx.fillRect(x+1, y-4, 1, 1);
+    } else {
+      btx.fillStyle = "#041b2e";
+      btx.fillRect(x-2, y-3, 1, 1);
+      btx.fillRect(x+1, y-3, 1, 1);
+    }
+
+    btx.globalAlpha = 1;
+  }
+
+  function drawBubbles(){
+    btx.globalAlpha = 0.8;
+    btx.fillStyle = "rgba(255,255,255,0.85)";
+    for (const b of bubbles){
+      btx.fillRect(Math.floor(b.x), Math.floor(b.y), 1, 1);
+    }
+    btx.globalAlpha = 1;
+  }
+
+  function drawHUD(){
+    // simple pixel HUD
+    btx.fillStyle = "rgba(0,0,0,0.28)";
+    btx.fillRect(4, 4, 98, 26);
+
+    btx.fillStyle = "rgba(255,255,255,0.92)";
+    btx.font = "10px system-ui";
+    btx.fillText(`Punti: ${state.score}`, 10, 16);
+    btx.fillStyle = "rgba(255,255,255,0.80)";
+    btx.fillText(`${km().toFixed(2)} km`, 10, 26);
+
+    // lives
+    btx.fillStyle = "rgba(255,255,255,0.85)";
+    const hearts = Math.max(0, Math.min(6, state.lives));
+    btx.fillText(`Vite: ${"❤".repeat(hearts)}${state.lives>6 ? "+" : ""}`, 10, 36);
+
+    // best (right)
+    btx.textAlign = "right";
+    btx.fillStyle = "rgba(255,255,255,0.78)";
+    btx.fillText(`Best: ${state.best}`, W()-6, 14);
+    btx.textAlign = "left";
+
+    if (!state.started && !state.over){
+      btx.fillStyle = "rgba(0,0,0,0.35)";
+      btx.fillRect(0, 0, W(), H());
+      btx.fillStyle = "rgba(255,255,255,0.92)";
+      btx.font = "12px system-ui";
+      btx.fillText("POLPO PIXEL", 10, Math.floor(H()*0.35));
+      btx.font = "10px system-ui";
+      btx.fillText("TAP / HOLD per salire", 10, Math.floor(H()*0.35)+14);
+      btx.fillText("Rilascia per scendere", 10, Math.floor(H()*0.35)+26);
+    }
+
+    if (state.over){
+      btx.fillStyle = "rgba(0,0,0,0.45)";
+      btx.fillRect(0, 0, W(), H());
+      btx.fillStyle = "rgba(255,255,255,0.95)";
+      btx.font = "12px system-ui";
+      btx.textAlign = "center";
+      btx.fillText("GAME OVER", Math.floor(W()/2), Math.floor(H()*0.35));
+      btx.font = "10px system-ui";
+      btx.fillText(`Punti: ${state.score}  Best: ${state.best}`, Math.floor(W()/2), Math.floor(H()*0.35)+14);
+
+      const bw = Math.min(170, W()*0.75), bh = 28;
+      const bx = Math.floor((W()-bw)/2), by = Math.floor(H()*0.62);
+      btx.fillStyle = "rgba(80,255,210,0.95)";
+      btx.fillRect(bx, by, bw, bh);
+      btx.fillStyle = "rgba(2,16,36,0.95)";
+      btx.fillText("RESTART", bx + bw/2, by + 18);
+      btx.textAlign = "left";
+    }
+  }
+
+  function drawSharkIntro(){
+    if (!state.started) return;
+    const elapsed = Math.min(2.6, state.t);
+    if (elapsed >= 2.6) return;
+
+    // big subtle silhouette left side
+    const fade = 1 - (elapsed/2.6);
+    btx.globalAlpha = 0.22 * fade;
+
+    const x = Math.floor(octo.x - 40 + Math.sin(state.t*2.1)*2);
+    const y = Math.floor(octo.y + 2 + Math.sin(state.t*2.7)*2);
+
+    btx.fillStyle = "rgba(0,0,0,0.65)";
+    btx.fillRect(x-22, y-6, 20, 10); // body
+    btx.fillRect(x-28, y-4, 6, 6);   // tail
+    btx.fillRect(x-10, y-10, 8, 4);  // fin
+    btx.fillRect(x-2, y-2, 6, 4);    // snout
+
+    btx.globalAlpha = 1;
+  }
+
+  // ---------- Update loop ----------
+  function step(ts){
+    if (!state.lastTs) state.lastTs = ts;
+    state.dt = Math.min(0.033, (ts - state.lastTs)/1000);
+    state.lastTs = ts;
+    state.t += state.dt;
+
+    // blink
+    octo.blink -= state.dt;
+    if (octo.blink <= 0 && Math.random() < 0.012) octo.blink = 0.12;
+
+    // inv
+    if (state.inv>0) state.inv = Math.max(0, state.inv - state.dt);
+
+    // speed
+    const kmVal = km();
+    const targetSpeed = speedAt(kmVal);
+    state.speed += (targetSpeed - state.speed) * (1 - Math.pow(0.001, state.dt));
+
+    const spawnInterval = spawnIntervalAt(kmVal);
+
+    if (state.started && !state.over){
+      // distance & score
+      state.distancePx += state.speed * state.dt;
+      const kmNow = Math.floor(state.distancePx / KM_PX);
+      if (kmNow > state.kmCount){
+        const delta = kmNow - state.kmCount;
+        state.kmCount = kmNow;
+        state.score += delta * POINTS_PER_KM;
+
+        for (let k=state.addedUpToKm+1; k<=kmNow; k++){
+          applyKmDecor(k);
+          state.addedUpToKm = k;
+        }
+
+        if (kmNow > 0 && kmNow % LIFE_EVERY_KM === 0){
+          state.lives += 1;
+          for (let i=0;i<10;i++) spawnBubble(octo.x, octo.y, rand(1.2,2.6));
+        }
+      }
+
+      // spawn obstacles
+      state.spawnTimer -= state.dt;
+      const last = obstacles[obstacles.length-1];
+      const minGapX = Math.max(70, state.speed * 0.72); // avoid impossible back-to-back
+      const okGap = !last || (W() + 20) - last.x >= minGapX;
+
+      if (state.spawnTimer <= 0 && okGap){
+        spawnObstacle();
+        state.spawnTimer = spawnInterval + rand(-0.08, 0.20);
+      }
+
+      // physics (hold = upward accel, longer hold = longer lift)
+      let ay = GRAVITY;
+      if (state.hold){
+        state.holdTime += state.dt;
+        // ramp thrust slightly (so tap is small lift, hold is stronger but capped)
+        const thrustK = clamp(0.65 + state.holdTime*1.4, 0.65, 1.18);
+        ay = GRAVITY - THRUST * thrustK;
+        // bubbles while holding
+        if (Math.random() < 0.20) spawnBubble(octo.x-8, octo.y+6, rand(1.0,2.0));
+      }
+
+      octo.vy += ay * state.dt;
+      octo.vy = clamp(octo.vy, MAX_VY_UP, MAX_VY_DOWN);
+      octo.y += octo.vy * state.dt;
+
+      // keep within screen (touching top/bottom counts as hit)
+      if (octo.y < 12){ octo.y = 12; takeHit(); octo.vy = 80; }
+      if (octo.y > H()-14){ octo.y = H()-14; takeHit(); octo.vy = -120; }
+
+      // move obstacles
+      for (let i=obstacles.length-1; i>=0; i--){
+        const o = obstacles[i];
+        o.x -= state.speed * state.dt;
+        if (o.x + o.w < -30) obstacles.splice(i,1);
+      }
+
+      // swimmers
+      for (let i=swimmers.length-1; i>=0; i--){
+        const s = swimmers[i];
+        s.x -= state.speed * s.spd * state.dt;
+        if (s.x < -60) swimmers.splice(i,1);
+      }
+      if (swimmers.filter(s=>s.kind==="fish").length < Math.min(MAX_FISH, 6 + Math.floor(kmVal/2))) spawnFish(false);
+      if (swimmers.length > MAX_FISH + 6) swimmers.splice(0, swimmers.length - (MAX_FISH + 6));
+
+      // bubbles
+      for (let i=bubbles.length-1; i>=0; i--){
+        const b = bubbles[i];
+        b.life += state.dt;
+        b.x += b.vx * state.dt;
+        b.y += b.vy * state.dt;
+        if (b.life > b.maxLife || b.y < -10) bubbles.splice(i,1);
+      }
+
+      // collision with corals (top+bottom rectangles)
+      const bx = octo.x - 5, by = octo.y - 5, bw = 10, bh = 10;
+
+      for (const o of obstacles){
+        const ox = o.x, ow = o.w;
+        const topRect = {x: ox, y: 0, w: ow, h: o.gapY};
+        const botRect = {x: ox, y: o.gapY + o.gapH, w: ow, h: H() - (o.gapY + o.gapH)};
+        if (aabb(bx,by,bw,bh, topRect.x, topRect.y, topRect.w, topRect.h) ||
+            aabb(bx,by,bw,bh, botRect.x, botRect.y, botRect.w, botRect.h)){
+          takeHit();
+          break;
+        }
+      }
+    } else {
+      // idle slight float
+      octo.y += Math.sin(state.t*1.6)*0.05;
+      octo.vy = 0;
+    }
+
+    // ---------- Render to buffer ----------
+    btx.save();
+
+    // screen shake in buffer coords
+    let sx = 0, sy = 0;
+    if (state.shake > 0){
+      state.shake = Math.max(0, state.shake - state.dt*14);
+      sx = (Math.random()*2-1)*state.shake;
+      sy = (Math.random()*2-1)*state.shake;
+    }
+    btx.translate(Math.floor(sx), Math.floor(sy));
+
+    drawBackground();
+
+    // swimmers behind obstacles
+    for (const s of swimmers) drawSwimmer(s);
+
+    // obstacles
+    for (const o of obstacles) drawObstacle(o);
+
+    // octopus
+    drawOcto();
+
+    // shark intro
+    drawSharkIntro();
+
+    // bubbles overlay
+    drawBubbles();
+
+    // HUD overlay
+    drawHUD();
+
+    btx.restore();
+
+    // ---------- Blit to screen (scaled pixelated) ----------
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(buf, 0, 0, canvas.width, canvas.height);
+
+    requestAnimationFrame(step);
+  }
+
+  // ---------- Boot ----------
+  reset();
+  requestAnimationFrame(step);
+
+})();
+</script>
+</body>
+</html>
